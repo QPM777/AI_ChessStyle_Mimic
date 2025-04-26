@@ -1,6 +1,6 @@
 # ChessStyle Mimic
 
-This project aims to mimic chess moves based on the playing style of different players.
+This project aims to mimic chess moves based on the playing style of dif ferent players.
 
 ## How to run the project
 
