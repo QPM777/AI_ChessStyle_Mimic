@@ -1,20 +1,21 @@
 import modal
-import torch
-from datasets import Dataset as HFDataset
+import pandas as pd
+from torch.utils.data import Dataset
 from transformers import (
     T5Tokenizer,
     T5ForConditionalGeneration,
+    DataCollatorForSeq2Seq,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
-    DataCollatorForSeq2Seq
 )
-import pandas as pd
-from torch.utils.data import Dataset
+from datasets import Dataset as HFDataset
 from tqdm import tqdm
+import torch
 
+# Initialisation de Modal
+stub = modal.App("flan-t5-train")
 
-stub = modal.App("flan-t5-train")  
-
+# Image Docker avec dépendances et fichier CSV
 image = (
     modal.Image.debian_slim()
     .pip_install(
@@ -26,10 +27,10 @@ image = (
         "tqdm",
         "transformers[torch]"
     )
-    .add_local_file("lichess_preprocessed.csv", remote_path="/root/lichess_preprocessed.csv")
+    .add_local_file("df_with_style.csv", remote_path="/root/lichess_preprocessed.csv")
 )
 
-
+# Dataset personnalisé
 class LiChessDataset(Dataset):
     def __init__(self, csv_file):
         self.df = pd.read_csv(csv_file)
@@ -51,12 +52,9 @@ class LiChessDataset(Dataset):
             f"with the {game['opening']} opening. Ratings were {game['white_elo']} (White) vs {game['black_elo']} (Black). "
             f"The result was {game['result']} by {game['termination']}."
         )
-
-        white_style = game['white_style'] if 'white_style' in game and pd.notnull(game['white_style']) else "Unknown"
-        black_style = game['black_style'] if 'black_style' in game and pd.notnull(game['black_style']) else "Unknown"
-
-        white_encoder_input = f"{base_description} This is from White's perspective. Style: {white_style}"
-        black_encoder_input = f"{base_description} This is from Black's perspective. Style: {black_style}"
+        
+        white_encoder_input = f"Perspective: White. {base_description} Style: {game["white_style"]}"
+        black_encoder_input = f"Perspective: Black. {base_description} Style: {game["black_style"]}"
 
         white_moves, black_moves, full_moves = self.parse_moves(game['moves'])
         decoder_input = ' '.join(full_moves)
@@ -69,6 +67,7 @@ class LiChessDataset(Dataset):
             "black_moves": ' '.join(black_moves),
         }
 
+# Préparation des données
 def prepare_data(dataset):
     data = {
         "input": [],
@@ -76,13 +75,19 @@ def prepare_data(dataset):
     }
     for i in tqdm(range(len(dataset))):
         item = dataset[i]
-        data["input"].append(item["white_encoder_input"])  
+
+        # Ajouter les deux perspectives
+        data["input"].append(item["white_encoder_input"])
         data["output"].append(item["decoder_input"])
+
+        data["input"].append(item["black_encoder_input"])
+        data["output"].append(item["decoder_input"])
+
     return data
 
+# Fonction d'entraînement + test
 @stub.function(image=image, timeout=1200, gpu="any")
 def train_and_test(description_to_test=None):
-
     dataset = LiChessDataset("/root/lichess_preprocessed.csv")
     data_dict = prepare_data(dataset)
     hf_dataset = HFDataset.from_dict(data_dict)
@@ -111,7 +116,7 @@ def train_and_test(description_to_test=None):
         save_steps=200,
         save_total_limit=1,
         predict_with_generate=True,
-        fp16=False, 
+        fp16=False,
     )
 
     data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
@@ -126,21 +131,14 @@ def train_and_test(description_to_test=None):
 
     trainer.train()
 
- 
     if description_to_test:
-
         inputs = tokenizer(description_to_test, return_tensors="pt", max_length=512, truncation=True)
-        
-
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model.to(device)
-
-
         inputs = {key: value.to(device) for key, value in inputs.items()}
 
-       
         outputs = model.generate(
-            inputs['input_ids'],  
+            inputs['input_ids'],
             max_length=128,
             num_beams=5,
             early_stopping=True
@@ -148,13 +146,16 @@ def train_and_test(description_to_test=None):
 
         predicted_moves = tokenizer.decode(outputs[0], skip_special_tokens=True)
         return predicted_moves
-    
+
     return "End of training"
 
 @stub.local_entrypoint()
 def main():
-    description = "In a Bullet game on Lichess.org, pink_overdoze played against fil77 with the Queen's Pawn opening. Ratings were 1750 (White) vs 1350 (Black). This is from White's perspective. Style: Unknown"
-    
+    description = (
+        "In a Bullet game on Lichess.org, pink_overdoze played against fil77 "
+        "with the Queen's Pawn opening. Ratings were 1750 (White) vs 1350 (Black). "
+        "Perspective: White. Style: Aggressive and tactical."
+    )
     result = train_and_test.remote(description)
     print(f"Description: {description}")
     print(f"Predicted moves: {result}")
